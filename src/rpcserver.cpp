@@ -33,6 +33,7 @@ using namespace json_spirit;
 using namespace std;
 
 static std::string strRPCUserColonPass;
+void ThreadRPCServer3(void* parg);
 
 static bool fRPCRunning = false;
 static bool fRPCInWarmup = true;
@@ -490,51 +491,52 @@ private:
 void ServiceConnection(AcceptedConnection* conn);
 
 //! Forward declaration required for RPCListen
-template <typename Protocol, typename SocketAcceptorService>
-static void RPCAcceptHandler(boost::shared_ptr<basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
-    ssl::context& context,
-    bool fUseSSL,
-    boost::shared_ptr<AcceptedConnection> conn,
-    const boost::system::error_code& error);
+template <typename Protocol>
+static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+                             ssl::context& context,
+                             bool fUseSSL,
+                             AcceptedConnection* conn,
+                             const boost::system::error_code& error);
 
 /**
  * Sets up I/O resources to accept and handle a new connection.
  */
-template <typename Protocol, typename SocketAcceptorService>
-static void RPCListen(boost::shared_ptr<basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
-    ssl::context& context,
-    const bool fUseSSL)
+template <typename Protocol>
+static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+                   ssl::context& context,
+                   const bool fUseSSL)
 {
     // Accept connection
-    boost::shared_ptr<AcceptedConnectionImpl<Protocol> > conn(new AcceptedConnectionImpl<Protocol>(acceptor->get_io_service(), context, fUseSSL));
+    AcceptedConnectionImpl<Protocol>* conn = new AcceptedConnectionImpl<Protocol>(acceptor->get_io_service(), context, fUseSSL);
 
     acceptor->async_accept(
-        conn->sslStream.lowest_layer(),
-        conn->peer,
-        boost::bind(&RPCAcceptHandler<Protocol, SocketAcceptorService>,
-            acceptor,
-            boost::ref(context),
-            fUseSSL,
-            conn,
-            _1));
+            conn->sslStream.lowest_layer(),
+            conn->peer,
+            boost::bind(&RPCAcceptHandler<Protocol>,
+                acceptor,
+                boost::ref(context),
+                fUseSSL,
+                conn,
+                boost::asio::placeholders::error));
 }
 
 
 /**
  * Accept and handle incoming connection.
  */
-template <typename Protocol, typename SocketAcceptorService>
-static void RPCAcceptHandler(boost::shared_ptr<basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
-    ssl::context& context,
-    const bool fUseSSL,
-    boost::shared_ptr<AcceptedConnection> conn,
-    const boost::system::error_code& error)
+template <typename Protocol>
+static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+                             ssl::context& context,
+                             const bool fUseSSL,
+                             AcceptedConnection* conn,
+                             const boost::system::error_code& error)
 {
     // Immediately start accepting new connections, except when we're cancelled or our socket is closed.
-    if (error != asio::error::operation_aborted && acceptor->is_open())
+    if (error != asio::error::operation_aborted
+     && acceptor->is_open())
         RPCListen(acceptor, context, fUseSSL);
 
-    AcceptedConnectionImpl<ip::tcp>* tcp_conn = dynamic_cast<AcceptedConnectionImpl<ip::tcp>*>(conn.get());
+    AcceptedConnectionImpl<ip::tcp>* tcp_conn = dynamic_cast< AcceptedConnectionImpl<ip::tcp>* >(conn);
 
     if (error) {
         // TODO: Actually handle errors
@@ -543,14 +545,18 @@ static void RPCAcceptHandler(boost::shared_ptr<basic_socket_acceptor<Protocol, S
     // Restrict callers by IP.  It is important to
     // do this before starting client thread, to filter out
     // certain DoS and misbehaving clients.
-    else if (tcp_conn && !ClientAllowed(tcp_conn->peer.address())) {
+    else if (tcp_conn
+          && !ClientAllowed(tcp_conn->peer.address()))
+    {
         // Only send a 403 if we're not using SSL to prevent a DoS during the SSL handshake.
         if (!fUseSSL)
-            conn->stream() << HTTPError(HTTP_FORBIDDEN, false) << std::flush;
-        conn->close();
+            conn->stream() << HTTPReply(HTTP_FORBIDDEN, "", false) << std::flush;
+        delete conn;
+    
+    // start HTTP client thread
     } else {
-        ServiceConnection(conn.get());
-        conn->close();
+        printf("Failed to create RPC server client thread\r\n");
+        delete conn;
     }
 }
 
@@ -612,7 +618,7 @@ void StartRPCThreads()
 
     assert(rpc_io_service == NULL);
     rpc_io_service = new asio::io_service();
-    rpc_ssl_context = new ssl::context(*rpc_io_service, ssl::context::sslv23);
+    ssl::context context(ssl::context::sslv23);
 
     const bool fUseSSL = GetBoolArg("-rpcssl", false);
 
@@ -634,7 +640,7 @@ void StartRPCThreads()
             LogPrintf("ThreadRPCServer ERROR: missing server private key file %s\n", pathPKFile.string());
 
         string strCiphers = GetArg("-rpcsslciphers", "TLSv1.2+HIGH:TLSv1+HIGH:!SSLv2:!aNULL:!eNULL:!3DES:@STRENGTH");
-        SSL_CTX_set_cipher_list(rpc_ssl_context->impl(), strCiphers.c_str());
+        SSL_CTX_set_cipher_list(context.native_handle(), strCiphers.c_str());
     }
 
     std::vector<ip::tcp::endpoint> vEndpoints;
